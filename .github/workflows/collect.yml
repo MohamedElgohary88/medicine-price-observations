@@ -1,0 +1,172 @@
+name: Collect source prices
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Public source operation
+        type: choice
+        required: true
+        default: probe
+        options:
+          - probe
+          - collect
+  schedule:
+    - cron: '20 3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-source-prices
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'probe'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Read repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Test and probe
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests
+          python3 collector.py --mode probe
+
+  collect:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'collect')
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Require main branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+      - name: Read repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Test and collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tests
+          python3 collector.py --mode collect
+      - name: Publish validated price file
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import sys
+          import urllib.request
+
+          API = "https://api.github.com/graphql"
+          OUTPUT = "data/prices.json"
+          MAX_BYTES = 4 * 1024 * 1024
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          def stop(message):
+              raise RuntimeError(message)
+
+          def graphql(query, variables):
+              request = urllib.request.Request(
+                  API,
+                  data=json.dumps({"query": query, "variables": variables}).encode("utf-8"),
+                  headers={
+                      "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
+                      "Content-Type": "application/json",
+                      "Accept": "application/json",
+                      "User-Agent": "public-source-price-feed",
+                  },
+                  method="POST",
+              )
+              opener = urllib.request.build_opener(NoRedirect())
+              with opener.open(request, timeout=60) as response:
+                  if response.status != 200 or response.geturl() != API:
+                      stop("GitHub API response rejected")
+                  raw = response.read(1024 * 1024 + 1)
+              if len(raw) > 1024 * 1024:
+                  stop("GitHub API response rejected")
+              result = json.loads(raw)
+              if result.get("errors") or not isinstance(result.get("data"), dict):
+                  stop("GitHub API request rejected")
+              return result["data"]
+
+          def publish():
+              if os.environ.get("GITHUB_REF") != "refs/heads/main":
+                  stop("Collection publication requires main")
+              path = Path(OUTPUT)
+              if path.is_symlink() or not path.is_file():
+                  stop("Validated output is missing")
+              content = path.read_bytes()
+              if not 0 < len(content) <= MAX_BYTES:
+                  stop("Validated output size rejected")
+              document = json.loads(content)
+              if (document.get("schema") != "source_price_feed_v1"
+                  or document.get("source_origin") != "https://russkaya-apteka.com"
+                  or not isinstance(document.get("pages"), list)
+                  or not document["pages"]):
+                  stop("Validated output schema rejected")
+              repository = os.environ["GITHUB_REPOSITORY"]
+              owner, name = repository.split("/", 1)
+              head_data = graphql(
+                  """query($owner: String!, $name: String!) {
+                    repository(owner: $owner, name: $name) {
+                      ref(qualifiedName: "refs/heads/main") { target { oid } }
+                    }
+                  }""",
+                  {"owner": owner, "name": name},
+              )
+              head = head_data["repository"]["ref"]["target"]["oid"]
+              if not re.fullmatch(r"[0-9a-f]{40}", head) or head != os.environ["GITHUB_SHA"]:
+                  stop("Main changed during collection; rerun required")
+              committed = graphql(
+                  """mutation($input: CreateCommitOnBranchInput!) {
+                    createCommitOnBranch(input: $input) {
+                      commit { oid signature { isValid wasSignedByGitHub } }
+                    }
+                  }""",
+                  {"input": {
+                      "branch": {"repositoryNameWithOwner": repository, "branchName": "main"},
+                      "expectedHeadOid": head,
+                      "message": {"headline": "Update observed source prices"},
+                      "fileChanges": {"additions": [{
+                          "path": OUTPUT,
+                          "contents": base64.b64encode(content).decode("ascii"),
+                      }]},
+                  }},
+              )["createCommitOnBranch"]["commit"]
+              signature = committed.get("signature") or {}
+              if not (signature.get("isValid") and signature.get("wasSignedByGitHub")):
+                  stop("Commit created; GitHub signature verification failed")
+              print("Published validated source prices in commit " + committed["oid"])
+
+          try:
+              publish()
+          except RuntimeError as error:
+              print(str(error), file=sys.stderr)
+              sys.exit(1)
+          except Exception:
+              print("Publication failed; inspect repository state before rerunning", file=sys.stderr)
+              sys.exit(1)
+          PY
